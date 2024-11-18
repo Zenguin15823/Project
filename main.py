@@ -1,5 +1,7 @@
 import zacgpt as zg
+import numpy as np
 
-ds = zg.retriveData()
+zg.generateRandomWeights()
 
-print(zg.embedData(ds, 256))
+ds = zg.retriveData()['train']['text']
+print(zg.forwardPass(ds))

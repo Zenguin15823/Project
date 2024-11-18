@@ -10,6 +10,8 @@ EMBEDDING_SIZE = 768 # this is decided by the model I used to embed the text
 NUM_HEADS = 2  # this is decided by me! it can be changed, but embedding_size/num_heads must be an integer
 NUM_LAYERS = 2 # number of decoder layers
 HIDDEN_LAYER_SIZE = EMBEDDING_SIZE * 4 # dimensionality of hidden layer in the FFNs. should be bigger than EMBEDDING_SIZE
+VOCAB_SIZE = 50257
+SEQUENCE_LENGTH = 16
 
 
 # Some simple math functions #
@@ -27,6 +29,13 @@ def softmax(vector):
 def reLU(matrix):
     np.maximum(matrix, 0, matrix)
     return matrix
+
+# layer normalization. returns normalized matrix
+# technically the result should have a learned weight and bias. maybe I will implement when I have the time
+def layerNorm(matrix):
+    mean = np.mean(matrix, axis=1, keepdims=True)
+    std = np.std(matrix, axis=1, keepdims=True)
+    return (matrix - mean) / (std + 0.00005) # the tiny value avoids div by 0
 
 
 # Mask generation #
@@ -64,14 +73,14 @@ def retriveData():
 # ds: dataset | max_len: how many tokens long each instance will be
 # returns: - a 3D matrix of shape (number of instances, max_len, embedding dimension)
 #          - a corresponding 3D matrix of padding masks
-def embedData(ds, max_len):
+def embedData(ds):
     # load a pretrained tokenizer and model to embed the data into vectors readable by the transformer
     # 'model' is itsself a transformer, however I am only using it for text embedding, not any actual transformer-ing
     tokenizer = AutoTokenizer.from_pretrained("distilbert/distilgpt2")
     model = AutoModel.from_pretrained("distilbert/distilgpt2")
 
     tokenizer.pad_token = tokenizer.eos_token # set the padding token to the end-of-sentence token
-    inputs = tokenizer(ds['train']['text'], max_length=max_len, return_tensors="pt", padding="max_length", truncation=True)
+    inputs = tokenizer(ds, max_length=SEQUENCE_LENGTH, return_tensors="pt", padding="max_length", truncation=True)
 
     # get embeddings by passing inputs through the model
     with torch.no_grad(): # this tells the model not to update its weights, since I'm just getting embeddings from it.
@@ -80,6 +89,13 @@ def embedData(ds, max_len):
     # the embeddings are in outputs.last_hidden_state
     token_embeddings = outputs.last_hidden_state
     return token_embeddings.numpy(), inputPaddingMasks(inputs['attention_mask'])
+
+# given a matrix of (sequence length, word probabilities), this will convert into tokens then into words!
+def deTokenize(probs):
+    tokenizer = AutoTokenizer.from_pretrained("distilbert/distilgpt2")
+    
+    tokens = np.argmax(probs, axis=1)
+    return tokenizer.decode(tokens)
 
 
 # Weight-related stuff #
@@ -102,12 +118,19 @@ def generateRandomWeights(fileName="weights.npz"):
         weights[name + "_W2"] = np.random.normal(loc=0.0, scale=0.01, size=(HIDDEN_LAYER_SIZE, EMBEDDING_SIZE))
         weights[name + "_b1"] = np.zeros(HIDDEN_LAYER_SIZE)
         weights[name + "_b2"] = np.zeros(EMBEDDING_SIZE)
+        
+    # we have one last matrix for the final linear layer
+    weights['final_layer'] = np.random.uniform(low=-0.1, high=0.1, size=(EMBEDDING_SIZE, VOCAB_SIZE))
+    
     # save them to a file, to be loaded another day!
     np.savez(fileName, **weights)
     
 # i'll let you guess what this one does
 def loadWeights(fileName="weights.npz"):
-    return np.load(fileName)
+    try:
+        return np.load(fileName)
+    except:
+        print("Error loading weights file. If none exists, generate one using the generateRandomWeights() method!")
 
 
 # Algorithms (the real stuff) #
@@ -169,8 +192,36 @@ def decoder(data, mask, weights, layer_num):
     # self-attention! yippee!
     attention_scores = selfAttention(data, wq, wk, wv, mask)
     
-    # TODO: add and normalize
+    # residual connection
+    attention_scores += data
+    attention_scores = layerNorm(attention_scores)
     
     fnn_results = feedForward(attention_scores, fnn_W1, fnn_W2, fnn_b1, fnn_b2)
     
-    # TODO: add and normalize
+    # residual connection
+    fnn_results += attention_scores
+    fnn_results = layerNorm(fnn_results)
+    
+    return fnn_results
+
+# this final linear layer transforms the matrix into a list of probabilities for each word in the sequence
+def finalLayer(data, weights):
+    probs = data @ weights['final_layer']
+    for vector in probs:
+        vector = softmax(vector)
+    return probs
+
+# this function puts it all together. just input a dataset and it will return some words
+def forwardPass(ds):
+    weights = loadWeights() # load the weights
+    
+    embeddings, masks = embedData(ds) # embed the data
+    # then, for each instance in the dataset, run through the transformer
+    results = []
+    for data, mask in zip(embeddings, masks):
+        for layer_num in range(1, NUM_LAYERS + 1):
+            data = decoder(data, mask, weights, layer_num)
+        probs = finalLayer(data, weights)
+        results.append(deTokenize(probs))
+        
+    return results
