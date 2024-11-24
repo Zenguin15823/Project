@@ -1,7 +1,9 @@
+import numpy as np
+import backprop as bp
 from datasets import load_dataset
 from transformers import AutoModel, AutoTokenizer
 import torch
-import numpy as np
+import time
 
 
 # Some constants #
@@ -25,17 +27,17 @@ def softmax(vector):
     return expVec / sum
 
 # ReLU activation, applied element-wise. 
-# this operates in place so it's not necessary to return anything, but will return matrix just in case
+# returns the input matrix with ReLU applied
 def reLU(matrix):
-    np.maximum(matrix, 0, matrix)
-    return matrix
+    return np.maximum(matrix, 0)
 
-# layer normalization. returns normalized matrix
-# technically the result should have a learned weight and bias. maybe I will implement when I have the time
+# layer normalization. returns normalized matrix and calculations dict for backpropagation
+# technically the result should have a learned weight and bias. maybe I will implement later
 def layerNorm(matrix):
-    mean = np.mean(matrix, axis=1, keepdims=True)
-    std = np.std(matrix, axis=1, keepdims=True)
-    return (matrix - mean) / (std + 0.00005) # the tiny value avoids div by 0
+    calculations = {'input' : matrix, 'epsilon' : 0.00005}
+    calculations['mean'] = np.mean(matrix, axis=1, keepdims=True)
+    calculations['std'] = np.std(matrix, axis=1, keepdims=True)
+    return (matrix - calculations['mean']) / (calculations['std'] + calculations['epsilon']), calculations
 
 
 # Mask generation #
@@ -57,15 +59,15 @@ def inputPaddingMasks(attention_masks):
 # this mask prevents attention from 'peeking ahead' during training
 def causalMask(sequence_length):
     mask = np.tril(np.ones((sequence_length, sequence_length)))
-    return np.where(mask == 0, -np.inf, 0)    
+    return np.where(mask == 0, -np.inf, 0) 
 
 
 # Data retrieval and token embedding #
 
 # import the imdb dataset, split into training and test
-# TODO: host this on UTD website
-def retriveData():
-    ds = load_dataset("stanfordnlp/imdb", split="train[:10]")
+# you may specify how many total instances are retrieved (before split)
+def retriveData(instances):
+    ds = load_dataset("stanfordnlp/imdb", split="train[:{}]".format(instances))
     ds = ds.train_test_split(test_size=0.2)
     return ds
 
@@ -73,6 +75,7 @@ def retriveData():
 # ds: dataset | max_len: how many tokens long each instance will be
 # returns: - a 3D matrix of shape (number of instances, max_len, embedding dimension)
 #          - a corresponding 3D matrix of padding masks
+#          - the tokenized, but not embedded, sequences; to be used for calculating loss
 def embedData(ds):
     # load a pretrained tokenizer and model to embed the data into vectors readable by the transformer
     # 'model' is itsself a transformer, however I am only using it for text embedding, not any actual transformer-ing
@@ -88,7 +91,7 @@ def embedData(ds):
 
     # the embeddings are in outputs.last_hidden_state
     token_embeddings = outputs.last_hidden_state
-    return token_embeddings.numpy(), inputPaddingMasks(inputs['attention_mask'])
+    return token_embeddings.numpy(), inputPaddingMasks(inputs['attention_mask']), inputs['input_ids']
 
 # given a matrix of (sequence length, word probabilities), this will convert into tokens then into words!
 def deTokenize(probs):
@@ -131,6 +134,9 @@ def loadWeights(fileName="weights.npz"):
         return np.load(fileName)
     except:
         print("Error loading weights file. If none exists, generate one using the generateRandomWeights() method!")
+        
+def saveWeights(weights, fileName="weights.npz"):
+    np.savez(fileName, **weights)
 
 
 # Algorithms (the real stuff) #
@@ -138,6 +144,10 @@ def loadWeights(fileName="weights.npz"):
 # this guy right here is the brains of this whole operation. they say that attention is all you need
 # data is the embedded input sequence. wQ/K/V are weights, mask is the padding mask for the input
 def selfAttention(data, wq, wk, wv, mask):
+    calculations = {'input' : data} # saving intermediate results for backprop
+    calculations['wq'] = wq
+    calculations['wk'] = wk
+    calculations['wv'] = wv
     head_outputs = []
     # multiply data by the weight matrices to get Q, K, V
     big_query = data @ wq
@@ -148,32 +158,45 @@ def selfAttention(data, wq, wk, wv, mask):
     all_keys = np.hsplit(big_key, NUM_HEADS)
     all_values = np.hsplit(big_value, NUM_HEADS)
     # now do the attention calculations for each head
-    for query, key, value in zip(all_queries, all_keys, all_values):
-        scores = query @ key.T # QK^T
-        scores /= np.sqrt(EMBEDDING_SIZE/NUM_HEADS) # QK^T / sqrt(d)
+    for query, key, value, head_num in zip(all_queries, all_keys, all_values, range(1, NUM_HEADS + 1)):
+        # save this stuff for backprop
+        calculations['head{}_query'.format(head_num)] = query
+        calculations['head{}_key'.format(head_num)] = key
+        calculations['head{}_value'.format(head_num)] = value
+        square = query @ key.T # QK^T
+        calculations['head{}_square'.format(head_num)] = square
+        regular = square / np.sqrt(EMBEDDING_SIZE/NUM_HEADS) # QK^T / sqrt(d)
+        calculations['head{}_regular'.format(head_num)] = regular
         # add padding and causal masks
-        scores += mask
-        scores += causalMask(len(mask))
+        mask += causalMask(len(mask))
+        calculations['head{}_mask'.format(head_num)] = mask
+        softmaxxed = regular + mask
          # apply softmax
-        for row in range(scores.shape[0]):
-            scores[row] = softmax(scores[row])
+        for row in range(softmaxxed.shape[0]):
+            softmaxxed[row] = softmax(softmaxxed[row])
+        calculations['head{}_softmaxxed'.format(head_num)] = softmaxxed
         # append this head's output to the list
-        head_outputs.append(scores @ value)
+        head_outputs.append(softmaxxed @ value)
         
-    # put all the head outputs back together to get our final product
-    return np.concatenate(head_outputs, axis=1)
+    # put all the head outputs back together to get our final product. also return calculations
+    return np.concatenate(head_outputs, axis=1), calculations
 
 # feed forward neural network. just a normal NN with one hidden layer and ReLU activation
 # data is the matrix of attention scores. w1, w2, b1, b2 are weights and biases corresponding to each layer
 def feedForward(data, w1, w2, b1, b2):
+    calculations = {'input' : data}
+    calculations['w1'] = w1
+    calculations['w2'] = w2
+    calculations['b1'] = b1
+    calculations['b2'] = b2
     # hidden layer
-    out_mat = data @ w1
-    out_mat += b1
-    reLU(out_mat)
+    calculations['hidden'] = data @ w1
+    calculations['hidden_bias'] = calculations['hidden'] + b1
+    calculations['relu'] = reLU(calculations['hidden_bias'])
     # output layer
-    out_mat = out_mat @ w2
-    out_mat += b2
-    return out_mat
+    calculations['output'] = calculations['relu'] @ w2
+    out_mat = calculations['output'] + b2
+    return out_mat, calculations
 
 # the logic for a whole decoder layer
 # data is a matrix (sequence length, embedding size); mask is the corresponding padding mask;
@@ -189,39 +212,50 @@ def decoder(data, mask, weights, layer_num):
     fnn_b1 = weights['fnn{}_b1'.format(layer_num)]
     fnn_b2 = weights['fnn{}_b2'.format(layer_num)]
     
+    # store calculations for use in backpropagation
+    calculations = {}
+    
     # self-attention! yippee!
-    attention_scores = selfAttention(data, wq, wk, wv, mask)
+    attention_scores, calculations['attention'] = selfAttention(data, wq, wk, wv, mask)
     
     # residual connection
     attention_scores += data
-    attention_scores = layerNorm(attention_scores)
+    attention_scores, calculations['norm1'] = layerNorm(attention_scores)
     
-    fnn_results = feedForward(attention_scores, fnn_W1, fnn_W2, fnn_b1, fnn_b2)
+    fnn_results, calculations['fnn'] = feedForward(attention_scores, fnn_W1, fnn_W2, fnn_b1, fnn_b2)
     
     # residual connection
     fnn_results += attention_scores
-    fnn_results = layerNorm(fnn_results)
+    fnn_results, calculations['norm2'] = layerNorm(fnn_results)
     
-    return fnn_results
+    return fnn_results, calculations
 
 # this final linear layer transforms the matrix into a list of probabilities for each word in the sequence
-def finalLayer(data, weights):
-    probs = data @ weights['final_layer']
+def finalLayer(data, weight):
+    probs = data @ weight
+    soft = []
     for vector in probs:
-        vector = softmax(vector)
-    return probs
+        soft.append(softmax(vector))
+    out = np.array(soft)
+    return out, {'input' : data, 'weight' : weight, 'out' : out}
 
-# this function puts it all together. just input a dataset and it will return some words
-def forwardPass(ds):
-    weights = loadWeights() # load the weights
+# this function trains the model using the dataset ds, and updates the weights in weightsFile
+def train(ds, step_size=0.001, weightsFile="weights.npz"):
+    start_time = time.time()
     
-    embeddings, masks = embedData(ds) # embed the data
-    # then, for each instance in the dataset, run through the transformer
-    results = []
-    for data, mask in zip(embeddings, masks):
+    weights = loadWeights(weightsFile) # load the weights
+    
+    embeddings, masks, targets = embedData(ds) # embed the data
+    # then, for each instance in the dataset, run through the transformer and backpropagation
+    for data, mask, target in zip(embeddings, masks, targets):
+        calculations = {}
         for layer_num in range(1, NUM_LAYERS + 1):
-            data = decoder(data, mask, weights, layer_num)
-        probs = finalLayer(data, weights)
-        results.append(deTokenize(probs))
+            data, calculations['layer{}'.format(layer_num)] = decoder(data, mask, weights, layer_num)
+        probs, calculations['final_layer'] = finalLayer(data, weights['final_layer'])
+        #print(probs)
+        # calculate error and backpropagate
+        weights = bp.backPropagation(calculations, target, weights, NUM_LAYERS, NUM_HEADS, step_size)
         
-    return results
+    saveWeights(weights, weightsFile)
+        
+    print("Processed {} instances in {} seconds.".format(len(embeddings), time.time()-start_time))
