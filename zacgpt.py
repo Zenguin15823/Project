@@ -1,5 +1,5 @@
-import numpy as np
 import backprop as bp
+import numpy as np
 from datasets import load_dataset
 from transformers import AutoModel, AutoTokenizer
 import torch
@@ -13,6 +13,7 @@ NUM_HEADS = 2  # this is decided by me! it can be changed, but embedding_size/nu
 NUM_LAYERS = 2 # number of decoder layers
 HIDDEN_LAYER_SIZE = EMBEDDING_SIZE * 4 # dimensionality of hidden layer in the FFNs. should be bigger than EMBEDDING_SIZE
 VOCAB_SIZE = 50257
+PAD_TOKEN = 50256
 SEQUENCE_LENGTH = 16
 
 
@@ -71,41 +72,42 @@ def retriveData(instances):
     ds = ds.train_test_split(test_size=0.2)
     return ds
 
-# text embedding
-# ds: dataset | max_len: how many tokens long each instance will be
-# returns: - a 3D matrix of shape (number of instances, max_len, embedding dimension)
-#          - a corresponding 3D matrix of padding masks
-#          - the tokenized, but not embedded, sequences; to be used for calculating loss
-def embedData(ds):
-    # load a pretrained tokenizer and model to embed the data into vectors readable by the transformer
-    # 'model' is itsself a transformer, however I am only using it for text embedding, not any actual transformer-ing
+# tokenization. handled by a library. returns a list of tokens for each instance in the dataset
+def tokenize(ds):
+    # load a pretrained tokenizer and use it. I consider this pre-processing in the context of the project
     tokenizer = AutoTokenizer.from_pretrained("distilbert/distilgpt2")
-    model = AutoModel.from_pretrained("distilbert/distilgpt2")
-
     tokenizer.pad_token = tokenizer.eos_token # set the padding token to the end-of-sentence token
     inputs = tokenizer(ds, max_length=SEQUENCE_LENGTH, return_tensors="pt", padding="max_length", truncation=True)
+    
+    return inputs['input_ids'], inputPaddingMasks(inputs['attention_mask'])
+
+# text embedding
+# inputs - a list of sequences of tokens
+# returns: - a 3D matrix of shape (number of instances, max_len, embedding dimension)
+#          - a corresponding 3D matrix of padding masks
+def embedData(inputs):
+    # load a pretrained model to embed the data into vectors readable by the transformer
+    # 'model' is itsself a transformer, however I am only using it for text embedding, not any actual transformer-ing
+    model = AutoModel.from_pretrained("distilbert/distilgpt2")
 
     # get embeddings by passing inputs through the model
     with torch.no_grad(): # this tells the model not to update its weights, since I'm just getting embeddings from it.
-        outputs = model(**inputs)
+        outputs = model.get_input_embeddings()(inputs)
 
-    # the embeddings are in outputs.last_hidden_state
-    token_embeddings = outputs.last_hidden_state
-    return token_embeddings.numpy(), inputPaddingMasks(inputs['attention_mask']), inputs['input_ids']
+    return outputs.numpy()
 
 # given a matrix of (sequence length, word probabilities), this will convert into tokens then into words!
-def deTokenize(probs):
+def deTokenize(tokens):
     tokenizer = AutoTokenizer.from_pretrained("distilbert/distilgpt2")
     
-    tokens = np.argmax(probs, axis=1)
     return tokenizer.decode(tokens)
 
 
 # Weight-related stuff #
 
-# generates random weights using a normal distribution centered around 0, and saves them to a file
-# you can specify the file if you want. should be a .npz
-def generateRandomWeights(fileName="weights.npz"):
+# generates random weights using a normal distribution centered around 0
+# returns dictionary of weights
+def generateRandomWeights():
     weights = {}
     # each layer gets its own weights for self-attention and for its feed-forward network
     attention_matrix_names = ["Wq", "Wk", "Wv"]
@@ -125,21 +127,33 @@ def generateRandomWeights(fileName="weights.npz"):
     # we have one last matrix for the final linear layer
     weights['final_layer'] = np.random.uniform(low=-0.1, high=0.1, size=(EMBEDDING_SIZE, VOCAB_SIZE))
     
-    # save them to a file, to be loaded another day!
-    np.savez(fileName, **weights)
+    return weights
     
-# i'll let you guess what this one does
+# loads weights from a file
 def loadWeights(fileName="weights.npz"):
     try:
         return np.load(fileName)
     except:
         print("Error loading weights file. If none exists, generate one using the generateRandomWeights() method!")
-        
+
+# i'll let you guess what this one does
 def saveWeights(weights, fileName="weights.npz"):
     np.savez(fileName, **weights)
 
 
 # Algorithms (the real stuff) #
+    
+# this is the loss function. input the calculated probabilities and it calculates cross-entropy loss
+# probs is (seq len, vocab size). return value is a number (Loss)
+def crossEntropyLoss(probs, correct_sequence):
+    loss = 0.0
+    n = probs.shape[0]
+    for i in range(probs.shape[0]):
+        if (correct_sequence[i] == PAD_TOKEN): # padding token, don't count this in loss
+            n -= 1
+        else:
+            loss += np.log(probs[i][correct_sequence[i]])
+    return -loss / (float)(n)
     
 # this guy right here is the brains of this whole operation. they say that attention is all you need
 # data is the embedded input sequence. wQ/K/V are weights, mask is the padding mask for the input
@@ -239,23 +253,57 @@ def finalLayer(data, weight):
     out = np.array(soft)
     return out, {'input' : data, 'weight' : weight, 'out' : out}
 
-# this function trains the model using the dataset ds, and updates the weights in weightsFile
-def train(ds, step_size=0.001, weightsFile="weights.npz"):
+# this function trains the model using the dataset ds, and updates the weights. returns updated weights
+def train(ds, weights, step_size=0.001):
     start_time = time.time()
+    instance_num = 0
     
-    weights = loadWeights(weightsFile) # load the weights
-    
-    embeddings, masks, targets = embedData(ds) # embed the data
+    targets, masks = tokenize(ds) # embed the data
+    embeddings = embedData(targets)
     # then, for each instance in the dataset, run through the transformer and backpropagation
+    for data, mask, target in zip(embeddings, masks, targets):
+        epoch_start = time.time()
+        instance_num += 1
+        calculations = {}
+        for layer_num in range(1, NUM_LAYERS + 1):
+            data, calculations['layer{}'.format(layer_num)] = decoder(data, mask, weights, layer_num)
+        probs, calculations['final_layer'] = finalLayer(data, weights['final_layer'])
+        # calculate error and backpropagate
+        weights = bp.backPropagation(calculations, target, weights, NUM_LAYERS, NUM_HEADS, step_size)
+        print("Instance {} finished in {} seconds.".format(instance_num, time.time()-epoch_start))
+        
+    print("Processed {} instances in {} seconds.".format(instance_num, time.time()-start_time))
+    return weights
+    
+# returns loss for the model defined by weights on the given dataset
+def evaluate(ds, weights):
+    loss = 0
+    
+    targets, masks = tokenize(ds) # embed the data
+    embeddings = embedData(targets)
+    # then, for each instance in the dataset, run through the transformer and evaluate loss
     for data, mask, target in zip(embeddings, masks, targets):
         calculations = {}
         for layer_num in range(1, NUM_LAYERS + 1):
             data, calculations['layer{}'.format(layer_num)] = decoder(data, mask, weights, layer_num)
         probs, calculations['final_layer'] = finalLayer(data, weights['final_layer'])
-        #print(probs)
-        # calculate error and backpropagate
-        weights = bp.backPropagation(calculations, target, weights, NUM_LAYERS, NUM_HEADS, step_size)
+        loss += crossEntropyLoss(probs, target)
         
-    saveWeights(weights, weightsFile)
+    return loss / len(embeddings) # average loss
+
+# this is the fun thing! generate some text! input a prompt and see what happens!
+def generate(weights, prompt):    
+    tokens, mask = tokenize(prompt)
+    tokens = tokens[0]
+
+    for i in range(SEQUENCE_LENGTH):
+        if tokens[i] == PAD_TOKEN:
+            data = embedData(tokens)
+            calculations = {}
+            for layer_num in range(1, NUM_LAYERS + 1):
+                data, calculations['layer{}'.format(layer_num)] = decoder(data, mask[0], weights, layer_num)
+            probs, calculations['final_layer'] = finalLayer(data, weights['final_layer'])
+            new_tokens = np.argmax(probs, axis=1)
+            tokens[i] = new_tokens[i]
         
-    print("Processed {} instances in {} seconds.".format(len(embeddings), time.time()-start_time))
+    return deTokenize(tokens)
